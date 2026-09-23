@@ -213,6 +213,67 @@ class PaymentResult(PaymentOut):
     outstanding: str
 
 
+class PaymentAllocationCreate(BaseModel):
+    """一笔来款在多张同币种待结发票间的分配请求。"""
+
+    currency: str = Field(
+        description="来款币种 ISO 4217 代码；只分配给同币种发票，不做跨币种换算，如 USD / JPY"
+    )
+    amount: str = Field(
+        description="来款总金额，十进制字符串，必须大于 0 且为币种最小单位的整数倍，如 '100.00'"
+    )
+    invoice_ids: list[int] = Field(
+        min_length=1,
+        description="待结发票 ID 列表，不得重复；只处理列表内发票，"
+        "实际按到期日升序（无到期日排最后）、同日按 ID 升序逐张抵扣",
+    )
+
+    @field_validator("currency")
+    @classmethod
+    def _upper_currency(cls, v: str) -> str:
+        return v.upper().strip()
+
+    @field_validator("amount")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"amount 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+    @field_validator("invoice_ids")
+    @classmethod
+    def _check_invoice_ids(cls, v: list[int]) -> list[int]:
+        for invoice_id in v:
+            if invoice_id <= 0:
+                raise ValueError(f"invoice_ids 必须是正整数，收到 {invoice_id}")
+        if len(v) != len(set(v)):
+            raise ValueError(f"invoice_ids 不得包含重复的发票 ID，收到 {v}")
+        return v
+
+
+class PaymentAllocationItem(BaseModel):
+    """单张发票在本次来款中的分配结果（按实际抵扣顺序排列）。"""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: int
+    due_date: str | None = None
+    allocated: str
+    outstanding: str
+    payment_id: int | None = None
+
+
+class PaymentAllocationResult(BaseModel):
+    """来款分配成功后的响应：逐发票分配金额与剩余余额。"""
+
+    model_config = ConfigDict(extra="allow")
+    currency: str
+    amount: str
+    allocated_total: str
+    created_at: str
+    allocations: list[PaymentAllocationItem]
+
+
 class PaymentOverview(BaseModel):
     """按发票查询的收款记录与未收余额。"""
 

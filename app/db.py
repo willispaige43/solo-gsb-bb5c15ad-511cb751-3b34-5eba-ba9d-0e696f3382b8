@@ -353,6 +353,153 @@ def register_payment(
     }
 
 
+def _paid_totals(conn: sqlite3.Connection, invoice_ids: list[int]) -> dict[int, Decimal]:
+    """一批发票的已收金额合计。用 Decimal 逐笔求和，不走 SQLite 的浮点 SUM 聚合。"""
+
+    if not invoice_ids:
+        return {}
+    placeholders = ",".join("?" for _ in invoice_ids)
+    rows = conn.execute(
+        f"SELECT invoice_id, amount FROM payments WHERE invoice_id IN ({placeholders})",
+        invoice_ids,
+    ).fetchall()
+    paid: dict[int, Decimal] = {}
+    for r in rows:
+        paid[int(r["invoice_id"])] = paid.get(
+            int(r["invoice_id"]), Decimal("0")
+        ) + Decimal(r["amount"])
+    return paid
+
+
+def allocate_payment(
+    conn: sqlite3.Connection,
+    currency: str,
+    amount: Decimal,
+    invoice_ids: list[int],
+) -> dict[str, Any]:
+    """把一笔来款分配到多张同币种发票上，整笔成功或整笔拒绝。
+
+    分配顺序：``due_date`` 升序（未设置到期日的排最后）、同一到期日按发票 ID
+    升序；只处理 ``invoice_ids`` 中的发票，不做跨币种换算。按顺序逐张抵扣：
+    每张分配 ``min(剩余来款, 该发票未收余额)``，来款用尽即止。
+
+    使用 ``BEGIN IMMEDIATE`` 在事务开始即取得写锁，与 :func:`register_payment`
+    及彼此的来款分配请求串行化：「读发票/已收合计 -> 校验 -> 写入多条 payments」
+    在同一事务内完成，并发收款不会超收。
+
+    任一前置条件不满足都回滚，**不留下任何收款记录**：
+
+    * 列表中任一发票不存在 -> :class:`InvoiceNotFoundError`
+    * 来款金额 ≤ 0、不是币种最小单位整数倍 -> ``ValueError``
+    * 发票币种与来款不一致 -> ``ValueError``
+    * 列表内发票未收余额合计 < 来款金额 -> ``ValueError``
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 调用方（schema 层）已保证列表非空且无重复，这里再防御性校验一次，
+        # 避免绕过 API 直接调用本函数时出现部分写入
+        if not invoice_ids:
+            raise ValueError("invoice_ids 不能为空")
+        if len(invoice_ids) != len(set(invoice_ids)):
+            raise ValueError("invoice_ids 不得包含重复的发票 ID")
+
+        placeholders = ",".join("?" for _ in invoice_ids)
+        rows = list(
+            conn.execute(
+                f"SELECT id, currency, currency_digits, due_date, total_gross"
+                f" FROM invoices WHERE id IN ({placeholders})",
+                invoice_ids,
+            ).fetchall()
+        )
+        found = {int(r["id"]): r for r in rows}
+        for invoice_id in invoice_ids:
+            if invoice_id not in found:
+                raise InvoiceNotFoundError(invoice_id)
+
+        digits_by_id = {int(r["id"]): int(r["currency_digits"]) for r in rows}
+        currencies = {r["currency"] for r in rows}
+        mismatched = sorted(c for c in currencies if c != currency)
+        if mismatched:
+            raise ValueError(
+                f"来款币种 {currency} 与发票币种不一致：{', '.join(mismatched)}；"
+                f"来款分配不做跨币种换算"
+            )
+        digits = digits_by_id[invoice_ids[0]]
+        unit = _minor_unit(digits)
+
+        if amount <= 0:
+            raise ValueError(f"来款金额必须大于 0，收到 {amount}")
+        if (amount / unit) != (amount / unit).to_integral_value():
+            raise ValueError(
+                f"来款金额 {amount} 不是 {currency} 最小单位 {unit} 的整数倍"
+            )
+        amount = amount.quantize(unit)
+
+        paid_map = _paid_totals(conn, invoice_ids)
+        outstanding: dict[int, Decimal] = {}
+        for invoice_id in invoice_ids:
+            r = found[invoice_id]
+            outstanding[invoice_id] = Decimal(r["total_gross"]) - paid_map.get(
+                invoice_id, Decimal("0")
+            )
+
+        total_outstanding = sum(outstanding.values(), Decimal("0"))
+        if amount > total_outstanding:
+            raise ValueError(
+                f"来款 {amount} {currency} 超出列表内发票未收余额合计 "
+                f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
+            )
+
+        # 到期日升序、NULL 排最后（is None -> True=1）；同日（含都为空）按 ID 升序
+        ordered_ids = sorted(
+            invoice_ids,
+            key=lambda i: (found[i]["due_date"] is None, found[i]["due_date"], i),
+        )
+
+        remaining = amount
+        created_at = utc_now_iso()
+        items: list[dict[str, Any]] = []
+        for invoice_id in ordered_ids:
+            due = outstanding[invoice_id]
+            allocated = remaining if remaining < due else due
+            payment_id: int | None = None
+            if allocated > 0:
+                cur = conn.execute(
+                    """
+                    INSERT INTO payments (invoice_id, amount, currency, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (invoice_id, format(allocated, "f"), currency, created_at),
+                )
+                payment_id = int(cur.lastrowid)
+                remaining -= allocated
+            items.append(
+                {
+                    "invoice_id": invoice_id,
+                    "due_date": found[invoice_id]["due_date"],
+                    "allocated": format(allocated, "f"),
+                    "outstanding": format(due - allocated, "f"),
+                    "payment_id": payment_id,
+                }
+            )
+        if remaining != 0:
+            # 不变量防御：上面已校验总未收充足，理论上不可能剩余
+            raise AssertionError(f"来款分配后仍有余额 {format(remaining, 'f')} 未抵扣")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "currency": currency,
+        "amount": format(amount, "f"),
+        "allocated_total": format(amount, "f"),
+        "created_at": created_at,
+        "allocations": items,
+    }
+
+
 def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:
     """某张发票的收款记录列表与未收余额（供 GET 使用）。"""
 

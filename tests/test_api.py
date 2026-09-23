@@ -485,6 +485,240 @@ class ApiTests(unittest.TestCase):
         status, _ = self._request("GET", "/api/v1/invoices/overdue?page_size=101")
         self.assertEqual(status, 422)
 
+    def test_13_payment_allocation(self) -> None:
+        # 待结发票：
+        #   A: USD 11.00 due 2026-09-10
+        #   B: USD 22.00 due 2026-09-05（最早到期）
+        #   C: USD 33.00 无到期日（排最后）
+        #   D: USD 44.00 due 2026-09-10（与 A 同日，id 大于 A）
+        #   J: JPY 1000   due 2026-08-01
+        def make(currency, gross, due_date):
+            payload = {"currency": currency, "lines": [{"net": gross, "tax_rate": "0"}]}
+            if due_date is not None:
+                payload["due_date"] = due_date
+            status, inv = self._request("POST", "/api/v1/invoices", payload)
+            self.assertEqual(status, 201, inv)
+            return inv["id"]
+
+        id_a = make("USD", "11.00", "2026-09-10")
+        id_b = make("USD", "22.00", "2026-09-05")
+        id_c = make("USD", "33.00", None)
+        id_d = make("USD", "44.00", "2026-09-10")
+        id_j = make("JPY", "1000", "2026-08-01")
+        self.assertLess(id_a, id_d)  # 同日按 id 升序
+
+        # 传入顺序故意打乱；分配顺序仍为 B -> A -> D -> C
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "usd", "amount": "50", "invoice_ids": [id_c, id_d, id_b, id_a]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["currency"], "USD")
+        self.assertEqual(body["amount"], "50.00")
+        self.assertEqual(body["allocated_total"], "50.00")
+        self.assertIn("created_at", body)
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["outstanding"])
+             for it in body["allocations"]],
+            [
+                (id_b, "22.00", "0.00"),
+                (id_a, "11.00", "0.00"),
+                (id_d, "17.00", "27.00"),
+                (id_c, "0.00", "33.00"),
+            ],
+        )
+        # 实际抵扣的三张各带 payment_id；未抵扣的 C 不产生流水
+        self.assertIsNone(body["allocations"][3]["payment_id"])
+        for it in body["allocations"][:3]:
+            self.assertIsInstance(it["payment_id"], int)
+        # 到期日按顺序回显
+        self.assertEqual(
+            [it["due_date"] for it in body["allocations"]],
+            ["2026-09-05", "2026-09-10", "2026-09-10", None],
+        )
+
+        # 单张收款查询必须看得到分配结果（沿用 payments 流水）
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_b}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["payment_count"], 1)
+        self.assertEqual(ov["payments"][0]["amount"], "22.00")
+        self.assertEqual(ov["payments"][0]["currency"], "USD")
+        self.assertEqual(ov["paid_total"], "22.00")
+        self.assertEqual(ov["outstanding"], "0.00")
+
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_d}/payments")
+        self.assertEqual(ov["payment_count"], 1)
+        self.assertEqual(ov["paid_total"], "17.00")
+        self.assertEqual(ov["outstanding"], "27.00")
+
+        # 未抵扣：没有流水
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_c}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+        self.assertEqual(ov["paid_total"], "0.00")
+        self.assertEqual(ov["outstanding"], "33.00")
+
+        # 逾期查询反映分配后的余额：A/B 已收满被排除，D 仍在
+        status, overdue = self._request(
+            "GET", "/api/v1/invoices/overdue?as_of=2026-09-23&page_size=100"
+        )
+        self.assertEqual(status, 200)
+        overdue_ids = {it["id"]: it for it in overdue["items"]}
+        self.assertNotIn(id_a, overdue_ids)
+        self.assertNotIn(id_b, overdue_ids)
+        self.assertNotIn(id_c, overdue_ids)  # 无到期日
+        d = overdue_ids[id_d]
+        self.assertEqual(d["paid_total"], "17.00")
+        self.assertEqual(d["outstanding"], "27.00")
+
+        # ---- 整笔拒绝场景：任何失败都不得留下部分收款 ----
+
+        # 总未收不足：D(27) + C(33) = 60，请求 60.01
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "60.01", "invoice_ids": [id_d, id_c]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("detail", resp)
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_d}/payments")
+        self.assertEqual(ov["payment_count"], 1)  # 仍是原来的 17.00
+        self.assertEqual(ov["paid_total"], "17.00")
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_c}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+
+        # 币种不符（JPY 列表里混了 USD 发票）
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "JPY", "amount": "1000", "invoice_ids": [id_j, id_c]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("USD", resp["detail"])
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_j}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+
+        # 发票不存在 -> 404，且不写入列表里其他发票
+        status, resp = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "1.00",
+             "invoice_ids": [id_c, 999999]},
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("999999", resp["detail"])
+        status, ov = self._request("GET", f"/api/v1/invoices/{id_c}/payments")
+        self.assertEqual(ov["payment_count"], 0)
+
+        # 列表重复 / 为空
+        status, _ = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "1.00",
+             "invoice_ids": [id_c, id_c]},
+        )
+        self.assertEqual(status, 422)
+        status, _ = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "1.00", "invoice_ids": []},
+        )
+        self.assertEqual(status, 422)
+
+        # 金额：≤0 / 小于最小单位 / 非十进制
+        for bad in ("0", "-1.00", "0.001", "abc"):
+            status, _ = self._request(
+                "POST",
+                "/api/v1/payment-allocations",
+                {"currency": "USD", "amount": bad, "invoice_ids": [id_c]},
+            )
+            self.assertEqual(status, 422, bad)
+
+        # 0 位小数币种：JPY 600 -> 分配 600，余 400，不带小数位
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "JPY", "amount": "600", "invoice_ids": [id_j]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["amount"], "600")
+        self.assertEqual(body["allocations"][0]["allocated"], "600")
+        self.assertEqual(body["allocations"][0]["outstanding"], "400")
+        # JPY 最小单位是 1，0.5 必须拒绝
+        status, _ = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "JPY", "amount": "0.5", "invoice_ids": [id_j]},
+        )
+        self.assertEqual(status, 422)
+        # 剩余 400 恰好收满
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "JPY", "amount": "400", "invoice_ids": [id_j]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["allocations"][0]["outstanding"], "0")
+
+        # 恰好 60 收满 D+C：两张都清零
+        status, body = self._request(
+            "POST",
+            "/api/v1/payment-allocations",
+            {"currency": "USD", "amount": "60.00",
+             "invoice_ids": [id_c, id_d]},
+        )
+        self.assertEqual(status, 201, body)
+        self.assertEqual(
+            [(it["invoice_id"], it["allocated"], it["outstanding"])
+             for it in body["allocations"]],
+            [(id_d, "27.00", "0.00"), (id_c, "33.00", "0.00")],
+        )
+
+    def test_14_allocation_concurrent_no_overpay(self) -> None:
+        # gross 100.00：7 个分配请求（列表各只含该发票）+ 3 个单张收款，
+        # 每个 20.00。BEGIN IMMEDIATE 串行化 -> 恰好 5 笔成功、5 笔 422，不超收
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD",
+             "due_date": "2026-08-01",
+             "lines": [{"net": "100.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+
+        codes: list[int] = []
+        lock = threading.Lock()
+
+        def allocate() -> None:
+            code, _ = self._request(
+                "POST",
+                "/api/v1/payment-allocations",
+                {"currency": "USD", "amount": "20.00", "invoice_ids": [invoice_id]},
+            )
+            with lock:
+                codes.append(code)
+
+        def single() -> None:
+            code, _ = self._request(
+                "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "20.00"}
+            )
+            with lock:
+                codes.append(code)
+
+        threads = [threading.Thread(target=allocate) for _ in range(7)]
+        threads += [threading.Thread(target=single) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(codes), [201] * 5 + [422] * 5)
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(ov["paid_total"], "100.00")
+        self.assertEqual(ov["outstanding"], "0.00")
+        self.assertEqual(ov["payment_count"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

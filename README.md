@@ -7,6 +7,7 @@
 - **残差固定分配且可复算**：发票总额与「逐行舍入后税额之和」的差（残差）按**最大余数法**确定性地分配回具体行，任何时候用同一请求复算结果完全一致（响应中带 `recompute_matched` 标志）。
 - **跨币种换算**：按请求汇率换算，原币金额完整保留，目标币独立做最小单位舍入与残差分配。
 - **收款登记**：按发票登记收款（发票币种字符串、必须大于 0），随时查询收款记录与未收余额；累计收款不得超过含税总额，校验与写入在同一 SQLite 事务中完成，并发不会超收。
+- **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
@@ -66,6 +67,11 @@ curl -s -X POST http://localhost:8000/api/v1/invoices/1/payments \
   -d '{"amount": "20.00"}'
 
 curl -s http://localhost:8000/api/v1/invoices/1/payments
+
+# 一笔来款分配到多张待结发票（按到期日升序、同日 ID 升序、无到期日排最后）
+curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"currency": "USD", "amount": "50.00", "invoice_ids": [1, 2, 3]}'
 
 # 查询已逾期且仍有未收余额的发票（as_of 缺省取 UTC 当前日期）
 curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of=2026-10-15'
@@ -161,6 +167,7 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `GET` | `/api/v1/invoices/overdue` | 逾期发票分页查询（按 id 倒序），支持 `page`、`page_size`、可选 `as_of` |
 | `POST` | `/api/v1/invoices/{id}/payments` | 登记一笔收款（发票币种字符串、必须大于 0），`201` |
 | `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录与未收余额 |
+| `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
 
 ### 3.1 创建发票 `POST /api/v1/invoices`
@@ -330,12 +337,80 @@ curl -s 'http://localhost:8000/api/v1/invoices/overdue'
 
 无逾期发票时 `items` 为空、`total`/`pages` 为 `0`。
 
-### 3.5 错误码
+### 3.5 来款分配 `POST /api/v1/payment-allocations`
+
+把一笔来款在**多张同币种待结发票**间按到期日顺序逐张抵扣。
+
+请求体（金额用字符串）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `currency` | string | 是 | 来款币种 ISO 4217 代码；只分配给同币种发票，**不做跨币种换算** |
+| `amount` | string | 是 | 来款总金额，必须 **大于 0** 且为币种最小单位的正整数倍（USD `100.00`，JPY `1000`） |
+| `invoice_ids` | int[] | 是 | 待结发票 ID 列表，**至少 1 个且不得重复**；只处理列表中的发票 |
+
+**抵扣规则**：
+
+1. 将列表内发票按 `due_date` **升序**排列——**未设置到期日的发票排最后**；
+   同一到期日（或都未设置到期日）按发票 **ID 升序**。
+2. 按该顺序逐张抵扣，每张分配 `min(剩余来款, 该发票未收余额)`；来款用尽即止，
+   之后的发票分配 `0`（**不产生**收款流水）。
+3. 列表内发票**未收余额合计小于来款金额**时，整笔请求返回 `422`，事务回滚，
+   **不会留下任何部分收款**。
+
+**校验（全部不通过则整笔拒绝，无任何写入）**：
+
+- 列表中任一发票不存在 → `404`；
+- 任一发票币种与来款不一致 → `422`；
+- 金额 ≤ 0、不是币种最小单位整数倍、非十进制字符串 → `422`；
+- 列表为空或包含重复 ID → `422`；
+- 总未收不足 → `422`。
+
+余额读取、校验与多条流水写入在**同一个 `BEGIN IMMEDIATE` 写事务**内完成，
+与单张收款接口共用同一串行化机制：来款分配之间、来款分配与单张收款并发时
+都不会超收。
+
+```bash
+# 假设发票 2（due 2026-09-05，gross 22.00）、1（due 2026-09-10，gross 11.00）、
+# 4（due 2026-09-10，gross 44.00）、3（无到期日，gross 33.00）
+curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"currency": "USD", "amount": "50.00", "invoice_ids": [3, 4, 2, 1]}'
+```
+
+即使入参顺序是 `[3, 4, 2, 1]`，响应仍按实际抵扣顺序返回 `2 → 1 → 4 → 3`，
+`201`：
+
+```json
+{
+  "currency": "USD",
+  "amount": "50.00",
+  "allocated_total": "50.00",
+  "created_at": "2026-09-23T03:00:00Z",
+  "allocations": [
+    {"invoice_id": 2, "due_date": "2026-09-05", "allocated": "22.00",
+     "outstanding": "0.00", "payment_id": 10},
+    {"invoice_id": 1, "due_date": "2026-09-10", "allocated": "11.00",
+     "outstanding": "0.00", "payment_id": 11},
+    {"invoice_id": 4, "due_date": "2026-09-10", "allocated": "17.00",
+     "outstanding": "27.00", "payment_id": 12},
+    {"invoice_id": 3, "due_date": null, "allocated": "0.00",
+     "outstanding": "33.00", "payment_id": null}
+  ]
+}
+```
+
+- `allocated` 为该发票本次分配金额，`outstanding` 为抵扣后各自剩余未收余额；
+- `payment_id` 指向沿用现有 `payments` 表写入的流水 ID；分配为 `0` 时为 `null`。
+  因此 `GET /api/v1/invoices/{id}/payments` 与逾期分页查询都能看到分配结果，
+  与单张收款登记完全一致。
+
+### 3.6 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在（含收款登记/查询时） |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款金额 ≤ 0、收款小于币种最小单位、累计收款超过含税总额、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
+| `404` | 发票 id 不存在（含单张收款登记/查询、来款分配时列表中任一 id 不存在） |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -376,7 +451,8 @@ pip install -r requirements.txt
 python -m unittest tests.test_calc -v
 
 # API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、收款登记/余额、
-# 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、持久化）
+# 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、
+# 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -387,14 +463,14 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 收款登记与余额查询
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 来款分配
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期模型）
-│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款）/ 查询（含逾期，WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 来款分配模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 来款分配）/ 查询（含逾期，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含并发收款不超收、到期日与逾期查询）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/来款分配并发不超收、到期日与逾期查询）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -403,6 +479,8 @@ python -m unittest tests.test_api -v
 
 存储模型：`invoices`（发票头 + 汇总金额 + 可选到期日 `due_date` + 原始请求 JSON，
 供复算）、`invoice_lines`（逐行最终税额/含税及换算列）与 `payments`（收款登记：
-金额、币种、登记时间）三张表，均通过外键级联删除。升级到含 `due_date` 的版本时，
+金额、币种、登记时间）三张表，均通过外键级联删除。来款分配不引入新表：每张被
+抵扣的发票向 `payments` 写入一条同构流水（整笔失败则全部不写），因此单张收款
+查询与逾期查询天然可见分配结果。升级到含 `due_date` 的版本时，
 服务启动会自动对旧库执行 `ALTER TABLE ... ADD COLUMN due_date`，历史发票的
 到期日为空、不会出现在逾期结果中。

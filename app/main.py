@@ -24,6 +24,8 @@ from .schemas import (
     InvoiceResult,
     PagedInvoices,
     PagedOverdueInvoices,
+    PaymentAllocationCreate,
+    PaymentAllocationResult,
     PaymentCreate,
     PaymentOverview,
     PaymentResult,
@@ -41,10 +43,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
+        "一笔来款在多张同币种待结发票间按到期日顺序分配、"
         "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -275,6 +278,30 @@ def register_payment(
         raise ValueError(f"收款金额必须大于 0，收到 {payload.amount!r}")
     try:
         return database.register_payment(conn, invoice_id, amount)
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/payment-allocations",
+    response_model=PaymentAllocationResult,
+    status_code=201,
+    tags=["payments"],
+)
+def allocate_payment(
+    payload: PaymentAllocationCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """一笔来款在多张待结发票间按到期日顺序分配，整笔成功或整笔拒绝。"""
+
+    amount = to_decimal(payload.amount, "amount")
+    if amount <= 0:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(f"来款金额必须大于 0，收到 {payload.amount!r}")
+    try:
+        return database.allocate_payment(
+            conn, payload.currency, amount, list(payload.invoice_ids)
+        )
     except database.InvoiceNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
