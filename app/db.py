@@ -353,6 +353,165 @@ def register_payment(
     }
 
 
+# ---- 来款分配（一笔来款分配到多张待结发票）----
+
+
+class CurrencyMismatchError(Exception):
+    """来款分配时发票币种与来款币种不一致。"""
+
+    def __init__(self, invoice_id: int, expected: str, actual: str) -> None:
+        self.invoice_id = invoice_id
+        super().__init__(
+            f"发票 {invoice_id} 币种为 {actual}，与来款币种 {expected} 不符，"
+            "本服务不做跨币种换算"
+        )
+
+
+def _invoices_for_allocation(
+    conn: sqlite3.Connection, invoice_ids: list[int], currency: str
+) -> list[sqlite3.Row]:
+    """取齐待分配发票并按分配顺序排序：到期日升序（NULL 最后）、同日 id 升序。
+
+    发票不存在抛 :class:`InvoiceNotFoundError`；币种与来款不一致抛
+    :class:`CurrencyMismatchError`。
+    """
+
+    placeholders = ",".join("?" for _ in invoice_ids)
+    rows = list(
+        conn.execute(
+            f"SELECT * FROM invoices WHERE id IN ({placeholders})",
+            invoice_ids,
+        ).fetchall()
+    )
+    found = {int(r["id"]) for r in rows}
+    missing = next((i for i in invoice_ids if i not in found), None)
+    if missing is not None:
+        raise InvoiceNotFoundError(missing)
+
+    for r in rows:
+        if r["currency"] != currency:
+            raise CurrencyMismatchError(int(r["id"]), currency, r["currency"])
+
+    # ISO 日期字符串可直接按字典序比较；NULL 排在所有已设置到期日的发票之后
+    rows.sort(
+        key=lambda r: (1, "", 0)
+        if r["due_date"] is None
+        else (0, r["due_date"], int(r["id"]))
+    )
+    return rows
+
+
+def allocate_incoming_payment(
+    conn: sqlite3.Connection,
+    currency: str,
+    amount: Decimal,
+    invoice_ids: list[int],
+    digits: int,
+) -> dict[str, Any]:
+    """把一笔来款分配到多张待结发票。
+
+    分配规则：按 ``due_date`` 升序（未设置到期日排最后）、同日按 id 升序逐张
+    抵扣，每张最多抵扣其当前未收余额（``total_gross − Σ payments.amount``）。
+    只处理 ``invoice_ids`` 中的发票，不跨币种换算。
+
+    「读余额 -> 校验总未收 -> 逐张计算 -> 多笔流水写入」全部在同一个
+    ``BEGIN IMMEDIATE`` 写事务内完成，与 :func:`register_payment` 共用同一把
+    SQLite 写锁，并发收款/分配不会超收。任一校验失败整体回滚，不留下任何
+    部分收款记录。
+
+    * 发票不存在 -> :class:`InvoiceNotFoundError`
+    * 发票币种与来款不一致 -> :class:`CurrencyMismatchError`
+    * 总未收小于来款金额，或金额不是最小单位整数倍 -> ``ValueError``
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = _invoices_for_allocation(conn, invoice_ids, currency)
+
+        unit = _minor_unit(digits)
+        if amount <= 0:
+            raise ValueError(f"来款金额必须大于 0，收到 {format(amount, 'f')}")
+        if (amount / unit) != (amount / unit).to_integral_value():
+            raise ValueError(
+                f"来款金额 {format(amount, 'f')} 不是 {currency} 最小单位 "
+                f"{format(unit, 'f')} 的整数倍"
+            )
+        amount = amount.quantize(unit)
+
+        # 锁内重新读取每张发票的已收合计（_paid_total 不另开事务，参与本事务的
+        # 一致性快照），得到各发票当前未收余额与可抵扣总额
+        items: list[dict[str, Any]] = []
+        total_outstanding = Decimal("0")
+        for r in rows:
+            inv_digits = int(r["currency_digits"])
+            inv_unit = _minor_unit(inv_digits)
+            gross = Decimal(r["total_gross"])
+            paid = _paid_total(conn, int(r["id"])).quantize(inv_unit)
+            outstanding = max(gross - paid, Decimal("0").quantize(inv_unit))
+            total_outstanding += outstanding
+            items.append(
+                {
+                    "id": int(r["id"]),
+                    "due_date": r["due_date"],
+                    "gross": gross,
+                    "paid_before": paid,
+                    "outstanding_before": outstanding,
+                }
+            )
+
+        if amount > total_outstanding:
+            raise ValueError(
+                f"来款 {format(amount, 'f')} {currency} 超出待结发票总未收余额 "
+                f"{format(total_outstanding, 'f')}，整笔拒绝，未登记任何记录"
+            )
+
+        # 逐张抵扣：排在前面的发票先吃满，直到来款分完
+        remaining = amount
+        created_at = utc_now_iso()
+        for item in items:
+            allocated = min(remaining, item["outstanding_before"])
+            item["allocated"] = allocated
+            remaining -= allocated
+            if allocated > 0:
+                cur = conn.execute(
+                    """
+                    INSERT INTO payments (invoice_id, amount, currency, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (item["id"], format(allocated, "f"), currency, created_at),
+                )
+                item["payment_id"] = int(cur.lastrowid)
+            else:
+                item["payment_id"] = None
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    allocations: list[dict[str, Any]] = []
+    for item in items:
+        new_paid = item["paid_before"] + item["allocated"]
+        new_outstanding = item["gross"] - new_paid
+        allocations.append(
+            {
+                "invoice_id": item["id"],
+                "due_date": item["due_date"],
+                "allocated": format(item["allocated"], "f"),
+                "paid_total": format(new_paid, "f"),
+                "outstanding": format(new_outstanding, "f"),
+                "payment_id": item["payment_id"],
+            }
+        )
+
+    return {
+        "currency": currency,
+        "amount": format(amount, "f"),
+        "remaining": format(remaining, "f"),
+        "allocations": allocations,
+        "created_at": created_at,
+    }
+
+
 def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:
     """某张发票的收款记录列表与未收余额（供 GET 使用）。"""
 

@@ -17,9 +17,11 @@ from fastapi.responses import JSONResponse
 
 from . import db as database
 from .calc import compute_invoice, recompute_matches, to_decimal
-from .currency import UnknownCurrencyError
+from .currency import UnknownCurrencyError, currency_digits
 from .schemas import (
     Health,
+    IncomingPaymentCreate,
+    IncomingPaymentResult,
     InvoiceCreate,
     InvoiceResult,
     PagedInvoices,
@@ -41,10 +43,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
+        "一笔来款按到期日顺序分配到多张待结发票、"
         "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -291,3 +294,39 @@ def read_payments(
     if row is None:
         raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
     return database.payment_overview(conn, row)
+
+
+@app.post(
+    "/api/v1/payments/allocate",
+    response_model=IncomingPaymentResult,
+    status_code=201,
+    tags=["payments"],
+)
+def allocate_incoming_payment(
+    payload: IncomingPaymentCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """一笔来款按到期日顺序分配到多张待结发票。
+
+    只处理 ``invoice_ids`` 列出的发票，不跨币种换算；金额必须为来款币种最小
+    单位的正整数倍，列表不得重复。发票不存在、币种不符或总未收不足时整笔
+    拒绝（不留下部分收款）。
+    """
+
+    amount = to_decimal(payload.amount, "amount")
+    if amount <= 0:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(f"来款金额必须大于 0，收到 {payload.amount!r}")
+    try:
+        digits = currency_digits(payload.currency)
+    except UnknownCurrencyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    try:
+        return database.allocate_incoming_payment(
+            conn, payload.currency, amount, payload.invoice_ids, digits
+        )
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except database.CurrencyMismatchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
